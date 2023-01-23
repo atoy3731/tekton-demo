@@ -1,0 +1,75 @@
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: carbide-docs-listener
+spec:
+  serviceAccountName: triggerer
+  triggers:
+    - name: rest-trigger
+      bindings:
+        - ref: build-image
+      template:
+        ref: carbide-docs-template
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: carbide-docs-template
+spec:
+  params:
+    - name: gitUrl
+    - name: gitBranch
+    - name: buildPath
+    - name: imageName
+    - name: imageTag
+    - name: publishACR
+      default: ${FKV_PUBLISH_ACR}
+    - name: kmsURI
+      default: ${FKV_KMS_URI}
+    - name: trivyServerAddress
+      default: http://trivy-trivy.trivy.svc.cluster.local:4954
+
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        generateName: carbide-docs-build-run-
+      spec:
+        serviceAccountName: carbide-docs-sa
+        pipelineRef:
+          name: builder-pipeline
+        podTemplate:
+          nodeSelector:
+            category: burst
+          tolerations:
+            - key: "category"
+              operator: Equal
+              value: burst
+              effect: NoSchedule
+
+        params:
+          - name: gitUrl
+            value: $(tt.params.gitUrl)
+          - name: gitBranch
+            value: $(tt.params.gitBranch)
+          - name: buildPath
+            value: $(tt.params.buildPath)
+          - name: imageName
+            value: $(tt.params.imageName)
+          - name: imageTag
+            value: $(tt.params.imageTag)
+          - name: servicesACR
+            value: $(tt.params.publishACR)
+          - name: kmsURI
+            value: $(tt.params.kmsURI)
+          - name: trivyServerAddress
+            value: $(tt.params.trivyServerAddress)
+
+        workspaces:
+          - name: working
+            emptyDir: {}
+          - name: work
+            emptyDir: {}
+          - name: azure-auth
+            emptyDir: {}

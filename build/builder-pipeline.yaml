@@ -1,0 +1,140 @@
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: builder-pipeline
+spec:
+  workspaces:
+    - name: working
+      description: "ephemeral working directory"
+    - name: work
+      description: "work dir"
+  params:
+    - name: gitUrl
+      description: "SSH URL of the Git repository"
+    - name: gitBranch
+      description: "Git branch to build from"
+    - name: buildPath
+      description: "Path to build in Git"
+    - name: dockerFile
+      description: "Dockerfile filename"
+      default: Dockerfile
+    - name: imageName
+      description: "Name of the image to build"
+    - name: imageTag
+      description: "Tag of the image to build"
+    - name: registry
+      description: "Registry to push artifacts to"
+
+  tasks:
+    - name: azure-login
+      params:
+        - name: ACR
+          value: $(params.servicesACR)
+        - name: imageName
+          value: $(params.imageName)
+        - name: imageTag
+          value: $(params.imageTag)
+      taskRef:
+        name: azure-login
+
+    - name: clone-build
+      params:
+        - name: git-url
+          value: $(params.gitUrl)
+        - name: git-branch
+          value: $(params.gitBranch)
+        - name: buildPath
+          value: $(params.buildPath)
+        - name: dockerFile
+          value: $(params.dockerFile)
+        - name: destImage
+          value: "$(tasks.azure-login.results.DEST_IMAGE_NAME):$(tasks.azure-login.results.DEST_IMAGE_TAG)"
+        - name: KMS_URI
+          value: $(params.kmsURI)
+        - name: ACR
+          value: $(params.servicesACR)
+        - name: secretHash
+          value: $(tasks.azure-login.results.SECRET_HASH)
+      workspaces:
+        - name: work
+          workspace: work
+        - name: azure-auth
+          workspace: azure-auth
+      runAfter:
+        - azure-login
+      taskRef:
+        name: clone-build
+
+    - name: compute-digest-tag
+      params:
+        - name: INPUT
+          value: $(tasks.clone-build.results.IMAGE_DIGEST)
+        - name: REGEX
+          value: ":"
+        - name: REPLACEMENT
+          value: "-"
+      runAfter:
+        - clone-build
+      taskRef:
+        name: sed
+
+    - name: syft-sbom
+      params:
+        - name: IMAGE_URL
+          value: "$(tasks.azure-login.results.DEST_IMAGE_NAME)"
+        - name: IMAGE_DIGEST
+          value: $(tasks.clone-build.results.IMAGE_DIGEST)
+        - name: IMAGE_TAG
+          value: $(tasks.azure-login.results.DEST_IMAGE_TAG)
+        - name: ACR
+          value: $(params.servicesACR)
+        - name: KMS_URI
+          value: $(params.kmsURI)
+        - name: secretHash
+          value: $(tasks.azure-login.results.SECRET_HASH)
+      taskRef:
+        name: syft
+      runAfter:
+        - compute-digest-tag
+      workspaces:
+        - name: output
+          workspace: working
+        - name: azure-auth
+          workspace: azure-auth
+
+    - name: trivy
+      params:
+        - name: IMAGE_URL
+          value: $(tasks.azure-login.results.DEST_IMAGE_NAME)
+        - name: IMAGE_DIGEST
+          value: $(tasks.azure-login.results.DEST_IMAGE_TAG)
+        - name: IMAGE_TAG
+          value: $(tasks.azure-login.results.DEST_IMAGE_TAG)
+        - name: KMS_URI
+          value: $(params.kmsURI)
+        - name: ACR
+          value: $(params.servicesACR)
+        - name: TRIVY_SERVER_ADDRESS
+          value: $(params.trivyServerAddress)
+        - name: secretHash
+          value: $(tasks.azure-login.results.SECRET_HASH)
+      taskRef:
+        name: trivy
+      runAfter:
+        - compute-digest-tag
+      workspaces:
+        - name: output
+          workspace: working
+        - name: azure-auth
+          workspace: azure-auth
+
+    - name: azure-cleanup
+      params:
+        - name: secretHash
+          value: $(tasks.azure-login.results.SECRET_HASH)
+      runAfter:
+        - syft-sbom
+        - trivy
+      taskRef:
+        name: azure-cleanup

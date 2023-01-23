@@ -1,0 +1,136 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: clone-build
+  annotations:
+    description: Git Clone & Kaniko Build
+spec:
+  workspaces:
+  - name: work
+    mountPath: /work
+
+  volumes:
+  - name: docker-config
+    secret:
+      secretName: docker-$(params.secretHash)
+
+  params:
+  - name: git-url
+    type: string
+    description: ssh url for git repo
+  - name: git-branch
+    type: string
+    description: branch of git repo
+    default: main
+  - name: buildPath
+    type: string
+    description: Path to build
+    default: "."
+  - name: dockerFile
+    type: string
+    description: Override dockerfile name
+    default: Dockerfile
+  - name: destImage
+    type: string
+    description: Destination image to build
+    default: "."
+  - name: secretHash
+    type: string
+
+  results:
+    - name: IMAGE_DIGEST
+
+  steps:
+    - name: sleep-sidecar
+      image: acrsharedservices.azurecr.us/ssf/copy-sign:1.0.0
+      script: |
+        #!/usr/bin/env sh
+        sleep 15
+
+    - name: create-azure-config
+      image: acrsharedservices.azurecr.us/ssf/copy-sign:1.0.0
+      script: |
+        #!/usr/bin/env sh
+        cp -rL /tmp/azure-working/* /tmp/azure
+        cp -rL /tmp/azure-working/.[^.]* /tmp/azure
+        mkdir -p /tmp/azure/commands
+        mkdir -p /tmp/azure/logs
+        mkdir -p /tmp/azure/telemetry
+      volumeMounts:
+      - name: azure-config
+        mountPath: "/tmp/azure-working"
+        readOnly: true
+
+    - name: git-clone
+      image: acrsharedservices.azurecr.us/alpine/git:v2.36.2
+      script: |
+        #!/usr/bin/env ash
+        ln -s /tekton/home/.ssh /root/.ssh
+
+        echo "Adding SSH key from service account to identity.."
+        eval $(ssh-agent)
+        ssh-add ~/.ssh/id_*
+
+        echo "Cloning $(params.git-url) [ $(params.git-branch) ]"
+        mkdir -p /work
+        cd /work
+        git clone $(params.git-url) source
+        cd source
+        git checkout $(params.git-branch)
+
+    - name: build-and-push
+      image: acrsharedservices.azurecr.us/kaniko-project/executor:v0.17.1
+      command:
+        - /kaniko/executor
+      args:
+        - --dockerfile=/work/source/$(params.buildPath)/$(params.dockerFile)
+        - --destination=$(params.destImage)
+        - --context=/work/source/$(params.buildPath)
+        - --digest-file=$(results.IMAGE_DIGEST.path)
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+      - name: docker-config
+        mountPath: "/kaniko/.docker"
+        readOnly: true
+      resources:
+        requests:
+          cpu: 750m
+          memory: 1Gi
+        limits:
+          cpu: "1"
+          memory: 2Gi
+
+    - name: cosign-sign
+      # image: acrsharedservices.azurecr.us/projectsigstore/cosign:v1.11.0
+      image: acrsharedservices.azurecr.us/ssf/copy-sign:1.0.0
+      env:
+        - name: AZURE_ENVIRONMENT
+          value: AzureUSGovernmentCloud
+        - name: AZURE_CONFIG_DIR
+          value: /tmp/azure
+        - name: DOCKER_CONFIG
+          value: /tmp/.docker
+      volumeMounts:
+      - name: docker-config
+        mountPath: "/tmp/.docker"
+        readOnly: true
+      command:
+        - cosign
+      args:
+        - sign
+        - --key=$(params.KMS_URI)
+        - $(params.destImage)
+      imagePullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 50m
+          memory: 1Gi
+        limits:
+          cpu: 100m
+          memory: 1Gi
+
+    # - name: exit-sidecar
+    #   image: acrsharedservices.azurecr.us/ssf/copy-sign:1.0.0
+    #   script: |
+    #     #!/usr/bin/env sh
+    #     curl -sf -XPOST http://127.0.0.1:15020/quitquitquit
